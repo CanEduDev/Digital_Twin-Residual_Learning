@@ -25,7 +25,6 @@ K_DELTA   = 1.38      # steering gain (column → road-wheel)
 TAU_DELTA = 0.028     # steering first-order lag [s]
 CD        = 3.0e-5    # quadratic drag [s/m]
 
-# ----------------------- HELPERS --------------------------
 
 def wrap_to_pi(angle: np.ndarray | float) -> np.ndarray | float:
     """Wrap an angle or array of angles to the range [-pi, pi]."""

@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-evaluate_model.py
-
-Loads a trained SVGP residual model and evaluates its performance against
-a baseline kinematic model and ground-truth data.
-
-Generates a 3-panel plot comparing trajectory, speed, and yaw.
-"""
 import math
 import argparse
 import numpy as np
@@ -16,16 +8,10 @@ import torch
 import gpytorch
 import matplotlib.pyplot as plt
 
-# ----------------------- BICYCLE PARAMETERS -----------------------
-# These must match the parameters used during training
-L         = 1.0       # wheel-base [m]
-K_DELTA   = 1.38      # steering gain (column → road-wheel)
-TAU_DELTA = 0.028     # steering first-order lag [s]
-CD        = 3.0e-5    # quadratic drag [s/m]
-
-# ----------------------- MODEL AND DATA HELPERS --------------------------
-# Helper functions and model class definitions must be available to load the model.
-# These are copied directly from the training script.
+L         = 1.0       
+K_DELTA   = 1.38      
+TAU_DELTA = 0.028     
+CD        = 3.0e-5    
 
 def wrap_to_pi(angle: float) -> float:
     """Wrap an angle to [-π, π]."""
@@ -92,7 +78,6 @@ class SVGPLayer(gpytorch.models.ApproximateGP):
         return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
 class ResidualModel(torch.nn.Module):
-    # Modified __init__ to accept args from the loaded checkpoint directly
     def __init__(self, ckpt_args, y_mean, y_std, device):
         super().__init__()
         self.device = device
@@ -109,7 +94,7 @@ class ResidualModel(torch.nn.Module):
         pred_norm = self.lik(dist).mean
         return pred_norm * self.y_std + self.y_mean
 
-# ----------------------- SIMULATION FUNCTIONS -----------------------
+
 def run_base_simulation(meas, ctrl, dt):
     """Runs the simulation using only the kinematic model without corrections."""
     print("Running base simulation...")
@@ -131,7 +116,7 @@ def run_corrected_simulation(model, meas, ctrl, H, dt, device):
     """Runs the simulation applying model-based corrections at each step."""
     print("Running corrected simulation...")
     N = len(meas)
-    model.eval() # Ensure model is in evaluation mode
+    model.eval() 
 
     sim_states = []
     state = meas[0].copy()
@@ -164,7 +149,6 @@ def run_corrected_simulation(model, meas, ctrl, H, dt, device):
         'speed': np.array([s['speed'] for s in sim_states]),
     }
 
-# ----------------------- PLOTTING AND ANALYSIS -----------------------
 def calculate_rmse(real_yaw, real_speed, real_pos_x, real_pos_y, sim_dict):
     """Calculates RMSE for position, speed, and yaw."""
     yaw_err = np.array([wrap_to_pi(ry - sy) for ry, sy in zip(real_yaw, sim_dict['yaw'])])
@@ -214,7 +198,6 @@ def plot_results(times, real, sim_base, sim_corr):
     print("\nSaved plot to evaluation_results.png")
     plt.show()
 
-# ----------------------- MAIN -----------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Evaluate a trained residual dynamics model.")
     p.add_argument("--csv", required=True, help="Path to the test data CSV file.")
@@ -222,12 +205,10 @@ if __name__ == "__main__":
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on (cuda or cpu).")
     args = p.parse_args()
 
-    # Load Model
     print(f"Loading model from {args.model} onto {args.device}...")
     ckpt = torch.load(args.model, map_location=args.device)
     model_args = ckpt['args']
-    
-    # Instantiate the model with saved hyperparameters
+
     model = ResidualModel(
         ckpt_args=model_args,
         y_mean=ckpt['y_mean'],
@@ -235,14 +216,12 @@ if __name__ == "__main__":
         device=args.device
     )
     
-    # *** FIX: Load the state_dict for each submodule individually ***
     model.encoder.load_state_dict(ckpt['encoder'])
     model.gp.load_state_dict(ckpt['gp'])
     model.lik.load_state_dict(ckpt['lik'])
     
     print("Model loaded successfully.")
 
-    # Load Data
     print(f"Loading test data from {args.csv}...")
     df = pd.read_csv(Path(args.csv))
     times = df["time"].values.astype(np.float32)
@@ -271,9 +250,7 @@ if __name__ == "__main__":
         })
         ctrl.append({'acc': acc_cmd[k], 'delta_cmd': steer_cmd[k]})
 
-    # Run simulations
     sim_base = run_base_simulation(meas, ctrl, dt)
     sim_corr = run_corrected_simulation(model, meas, ctrl, model_args['hist'], dt, args.device)
-    
-    # Plot results
+
     plot_results(times, real, sim_base, sim_corr)
