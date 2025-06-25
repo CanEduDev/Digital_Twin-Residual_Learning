@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
+import matplotlib
+matplotlib.use("Qt5Agg") 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

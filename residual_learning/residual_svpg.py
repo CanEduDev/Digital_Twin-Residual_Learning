@@ -18,6 +18,8 @@ from pathlib import Path
 import torch
 import gpytorch
 from tqdm import tqdm
+import matplotlib
+matplotlib.use("Qt5Agg") 
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts

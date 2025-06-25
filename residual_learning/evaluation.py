@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 import gpytorch
 from tqdm import tqdm
+import matplotlib
+matplotlib.use("Qt5Agg") 
 import matplotlib.pyplot as plt
 
 # ----------------------- BICYCLE PARAMETERS -----------------------
@@ -216,7 +218,7 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     print(f"Loading model from {args.model} onto {args.device}...")
-    ckpt = torch.load(args.model, map_location=args.device)
+    ckpt = torch.load(args.model, map_location=args.device, weights_only=False)
     model_args = ckpt['args']
 
     # --- DYNAMICALLY LOAD THE CORRECT MODEL AND ENCODER ---
