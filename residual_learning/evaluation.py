@@ -36,30 +36,53 @@ def feat_tensor(state: dict, control: dict, device) -> torch.Tensor:
         control['acc'], control['delta_cmd']
     ], dtype=torch.float32, device=device)
 
-# ----------------------- ENCODER DEFINITIONS -----------------------
+# ----------------------- ENCODER DEFINITIONS (Use these in BOTH scripts) -----------------------
+
 class TransformerEncoder(torch.nn.Module):
     def __init__(self, input_dim=6, d_model=32, nhead=2, d_hid=128, nlayers=2, dropout=0.1):
         super().__init__()
         self.proj = torch.nn.Linear(input_dim, d_model)
         encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
         self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
+        self.final_norm = torch.nn.LayerNorm(d_model) # This layer was missing
         self.outp = torch.nn.Linear(d_model, d_model)
+
     def forward(self, x):
-        h = self.proj(x); h = self.transformer_encoder(h); h = h.mean(dim=1); return self.outp(h)
+        h = self.proj(x)
+        h = self.transformer_encoder(h)
+        h = h.mean(dim=1)
+        h = self.outp(h)
+        return self.final_norm(h) # This line was missing
 
 class LSTMEncoder(torch.nn.Module):
     def __init__(self, input_dim=6, d_model=32, nlayers=2, dropout=0.1):
         super().__init__()
-        self.lstm = torch.nn.LSTM(input_dim, d_model, nlayers, batch_first=True, dropout=dropout if nlayers > 1 else 0)
+        self.lstm = torch.nn.LSTM(
+            input_size=input_dim,
+            hidden_size=d_model,
+            num_layers=nlayers,
+            batch_first=True,
+            dropout=dropout if nlayers > 1 else 0
+        )
+        self.final_norm = torch.nn.LayerNorm(d_model) # This layer was missing
     def forward(self, x):
-        h_t, _ = self.lstm(x); return h_t[:, -1, :]
+        h_t, _ = self.lstm(x)
+        return self.final_norm(h_t[:, -1, :]) # This line was missing
 
 class GRUEncoder(torch.nn.Module):
     def __init__(self, input_dim=6, d_model=32, nlayers=2, dropout=0.1):
         super().__init__()
-        self.gru = torch.nn.GRU(input_dim, d_model, nlayers, batch_first=True, dropout=dropout if nlayers > 1 else 0)
+        self.gru = torch.nn.GRU(
+            input_size=input_dim,
+            hidden_size=d_model,
+            num_layers=nlayers,
+            batch_first=True,
+            dropout=dropout if nlayers > 1 else 0
+        )
+        self.final_norm = torch.nn.LayerNorm(d_model) # This layer was missing
     def forward(self, x):
-        h_t, _ = self.gru(x); return h_t[:, -1, :]
+        h_t, _ = self.gru(x)
+        return self.final_norm(h_t[:, -1, :]) # This line was missing
 
 # ----------------------- SVGP LAYER (Unchanged) -----------------------
 class SVGPLayer(gpytorch.models.ApproximateGP):

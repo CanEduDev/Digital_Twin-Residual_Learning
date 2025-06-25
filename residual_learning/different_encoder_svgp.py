@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-train_multi_encoder_svgp.py - MODULAR & OPTIMIZED FOR SPEED
+train_unified.py - MODULAR & OPTIMIZED FOR SPEED
+- ADDED: Choice between SVGP and Linear models.
+- ADDED: Logic to save the best model based on validation set performance.
 
-Train an SVGP residual model for YAW RATE ONLY with a choice of sequence encoders
-(Transformer, LSTM, or GRU) and genuine multi-step rollout loss.
+Train a residual model for YAW RATE ONLY with a choice of:
+1. Model Type: SVGP (probabilistic) or Linear (deterministic)
+2. Encoder: Transformer, LSTM, or GRU
+... and genuine multi-step rollout loss.
 """
 import math
 import argparse
@@ -23,7 +27,7 @@ K_DELTA   = 1.38      # steering gain (column → road-wheel)
 TAU_DELTA = 0.028     # steering first-order lag [s]
 CD        = 3.0e-5    # quadratic drag [s/m]
 
-# ----------------------- HELPERS --------------------------
+# ----------------------- HELPERS (Unchanged) --------------------------
 def wrap_to_pi(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
@@ -69,249 +73,245 @@ class TransformerEncoder(torch.nn.Module):
         self.proj = torch.nn.Linear(input_dim, d_model)
         encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
         self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
+        self.final_norm = torch.nn.LayerNorm(d_model)
         self.outp = torch.nn.Linear(d_model, d_model)
-
     def forward(self, x):
-        h = self.proj(x)
-        h = self.transformer_encoder(h)
-        # Use the features from the last time step
-        h = h.mean(dim=1)
-        return self.outp(h)
+        h = self.proj(x); h = self.transformer_encoder(h); h = h.mean(dim=1); h = self.outp(h); return self.final_norm(h)
 
 class LSTMEncoder(torch.nn.Module):
     def __init__(self, input_dim=6, d_model=32, nlayers=2, dropout=0.1):
         super().__init__()
-        self.lstm = torch.nn.LSTM(
-            input_size=input_dim,
-            hidden_size=d_model,
-            num_layers=nlayers,
-            batch_first=True,
-            dropout=dropout if nlayers > 1 else 0
-        )
+        self.lstm = torch.nn.LSTM(input_dim, d_model, nlayers, batch_first=True, dropout=dropout if nlayers > 1 else 0)
+        self.final_norm = torch.nn.LayerNorm(d_model)
     def forward(self, x):
-        # We only care about the last output, not the hidden states
-        # h_t shape: (batch_size, sequence_length, hidden_size)
-        h_t, _ = self.lstm(x)
-        # Return the output of the last time step
-        return h_t[:, -1, :]
+        h_t, _ = self.lstm(x); return self.final_norm(h_t[:, -1, :])
 
 class GRUEncoder(torch.nn.Module):
     def __init__(self, input_dim=6, d_model=32, nlayers=2, dropout=0.1):
         super().__init__()
-        self.gru = torch.nn.GRU(
-            input_size=input_dim,
-            hidden_size=d_model,
-            num_layers=nlayers,
-            batch_first=True,
-            dropout=dropout if nlayers > 1 else 0
-        )
+        self.gru = torch.nn.GRU(input_dim, d_model, nlayers, batch_first=True, dropout=dropout if nlayers > 1 else 0)
+        self.final_norm = torch.nn.LayerNorm(d_model)
     def forward(self, x):
-        h_t, _ = self.gru(x)
-        return h_t[:, -1, :]
+        h_t, _ = self.gru(x); return self.final_norm(h_t[:, -1, :])
 
-# ----------------------- SVGP LAYER (Unchanged) -----------------------
+# ----------------------- SVGP LAYER -----------------------
 class SVGPLayer(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points):
-        num_tasks = 1
-        variational_dist = gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0), batch_shape=torch.Size([num_tasks]))
+        num_tasks = 1; variational_dist = gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0), batch_shape=torch.Size([num_tasks]))
         variational_strat = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_dist, learn_inducing_locations=True)
-        mts = gpytorch.variational.IndependentMultitaskVariationalStrategy(variational_strat, num_tasks=num_tasks)
-        super().__init__(mts)
-        bs = torch.Size([num_tasks])
-        self.mean_module  = gpytorch.means.ConstantMean(batch_shape=bs)
+        mts = gpytorch.variational.IndependentMultitaskVariationalStrategy(variational_strat, num_tasks=num_tasks); super().__init__(mts)
+        bs = torch.Size([num_tasks]); self.mean_module  = gpytorch.means.ConstantMean(batch_shape=bs)
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5, batch_shape=bs) + gpytorch.kernels.RBFKernel(batch_shape=bs), batch_shape=bs)
-    def forward(self, x):
-        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
+    def forward(self, x): return gpytorch.distributions.MultivariateNormal(self.mean_module(x), self.covar_module(x))
 
-# ----------------------- MODULAR RESIDUAL MODEL -----------------------
-class ResidualModel(torch.nn.Module):
+# ----------------------- MODEL DEFINITIONS -----------------------
+def build_encoder(encoder_type, d_model, encoder_args):
+    """Factory function to build the chosen encoder."""
+    if encoder_type == 'transformer': return TransformerEncoder(input_dim=6, d_model=d_model, **encoder_args)
+    if encoder_type == 'lstm': return LSTMEncoder(input_dim=6, d_model=d_model, **encoder_args)
+    if encoder_type == 'gru': return GRUEncoder(input_dim=6, d_model=d_model, **encoder_args)
+    raise ValueError(f"Unknown encoder type: {encoder_type}")
+
+class ResidualModel_SVGP(torch.nn.Module):
     def __init__(self, encoder_type, encoder_args, y_mean, y_std, d_model, n_inducing, lr, weight_decay, device):
-        super().__init__()
-        self.device = device
-        self.y_mean = torch.tensor(y_mean, dtype=torch.float32, device=device)
-        self.y_std  = torch.tensor(y_std,  dtype=torch.float32, device=device)
-        
-        # --- SELECT AND BUILD THE CHOSEN ENCODER ---
-        if encoder_type == 'transformer':
-            self.encoder = TransformerEncoder(input_dim=6, d_model=d_model, **encoder_args).to(device)
-        elif encoder_type == 'lstm':
-            self.encoder = LSTMEncoder(input_dim=6, d_model=d_model, **encoder_args).to(device)
-        elif encoder_type == 'gru':
-            self.encoder = GRUEncoder(input_dim=6, d_model=d_model, **encoder_args).to(device)
-        else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
-
-        Z = torch.randn(n_inducing, d_model, device=device)
-        self.gp  = SVGPLayer(Z).to(device)
+        super().__init__(); self.device = device
+        self.y_mean = torch.tensor(y_mean, dtype=torch.float32, device=device); self.y_std  = torch.tensor(y_std,  dtype=torch.float32, device=device)
+        self.encoder = build_encoder(encoder_type, d_model, encoder_args).to(device)
+        Z = torch.randn(n_inducing, d_model, device=device); self.gp  = SVGPLayer(Z).to(device)
         self.lik = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=1).to(device)
         self.mll = gpytorch.mlls.VariationalELBO(self.lik, self.gp, num_data=1)
-        self.opt = torch.optim.Adam([
-            {'params': self.encoder.parameters(), 'lr': lr, 'weight_decay': weight_decay},
-            {'params': self.gp.parameters(),      'lr': lr, 'weight_decay': weight_decay},
-            {'params': self.lik.parameters(),     'lr': lr}
-        ])
-
+        self.opt = torch.optim.Adam([{'params': self.encoder.parameters(), 'lr': lr, 'weight_decay': weight_decay}, {'params': self.gp.parameters(), 'lr': lr, 'weight_decay': weight_decay}, {'params': self.lik.parameters(), 'lr': lr}])
     def forward(self, x):
-        z    = self.encoder(x)
-        dist = self.gp(z)
-        pred_norm = self.lik(dist).mean
+        z = self.encoder(x); dist = self.gp(z); pred_norm = self.lik(dist).mean
         return pred_norm * self.y_std + self.y_mean
 
-# ----------------------- BUILD DATA (Unchanged) -----------------------
+class ResidualModel_Linear(torch.nn.Module):
+    def __init__(self, encoder_type, encoder_args, y_mean, y_std, d_model, lr, weight_decay, device):
+        super().__init__(); self.device = device
+        self.y_mean = torch.tensor(y_mean, dtype=torch.float32, device=device); self.y_std  = torch.tensor(y_std,  dtype=torch.float32, device=device)
+        self.encoder = build_encoder(encoder_type, d_model, encoder_args).to(device)
+        self.regressor = torch.nn.Linear(d_model, 1).to(device)
+        self.loss_fn = torch.nn.MSELoss()
+        self.opt = torch.optim.Adam([{'params': self.encoder.parameters(), 'lr': lr, 'weight_decay': weight_decay},{'params': self.regressor.parameters(), 'lr': lr, 'weight_decay': weight_decay}])
+    def forward(self, x):
+        z = self.encoder(x); pred_norm = self.regressor(z)
+        return pred_norm * self.y_std + self.y_mean
+    def predict_normalized(self, x):
+        z = self.encoder(x); return self.regressor(z)
+
+# ----------------------- BUILD DATA -----------------------
 def build_data(meas, ctrl, H, dt):
-    N = len(meas); M = N - (H + 1)
-    X = np.zeros((M, H, 6), np.float32); Y = np.zeros((M, 1), np.float32)
-    print("Building one-step residual training data for yaw rate (r_z)...")
+    N = len(meas); M = N - (H + 1); X = np.zeros((M, H, 6), np.float32); Y = np.zeros((M, 1), np.float32)
+    print("Building one-step residual training data...");
     for i in tqdm(range(M)):
         for j in range(H):
-            k = i + j
-            X[i, j] = [meas[k]['a_x'], meas[k]['speed'], math.sin(meas[k]['yaw']), math.cos(meas[k]['yaw']), ctrl[k]['acc'], ctrl[k]['delta_cmd']]
-        state0 = meas[i+H-1].copy(); control0 = ctrl[i+H-1].copy()
-        next_state = simulate_step(state0, control0, dt)
+            k = i + j; X[i, j] = [meas[k]['a_x'], meas[k]['speed'], math.sin(meas[k]['yaw']), math.cos(meas[k]['yaw']), ctrl[k]['acc'], ctrl[k]['delta_cmd']]
+        state0 = meas[i+H-1].copy(); control0 = ctrl[i+H-1].copy(); next_state = simulate_step(state0, control0, dt)
         Y[i, 0] = meas[i+H]['r_z'] - next_state['r_z']
     return torch.from_numpy(X), torch.from_numpy(Y)
 
-# ----------------------- TRAIN + ROLLOUT (Unchanged) -----------------------
-def train_rollout(model, train_loader, val_loader, meas, ctrl, H, dt, device, epochs, args, patience=10):
-    scheduler = CosineAnnealingWarmRestarts(model.opt, T_0=20, T_mult=2)
-    N = len(meas); K_roll = args.k_roll
+# ----------------------- GENERIC ROLLOUT STEP -----------------------
+def rollout_step(model, hists, i0s, H, N, K_roll, meas, ctrl, dt, device):
+    """A generic function to perform one rollout step, used by both training loops."""
+    roll_r_loss = 0.0
+    B = hists.size(0)
+    # This state is only used for the first step of the inner loop
+    initial_indices = i0s + H - 1
+    batch_states = {
+        'pos_x': torch.tensor([meas[i]['pos_x'] for i in initial_indices], device=device, dtype=torch.float32),
+        'pos_y': torch.tensor([meas[i]['pos_y'] for i in initial_indices], device=device, dtype=torch.float32),
+        'yaw':   torch.tensor([meas[i]['yaw'] for i in initial_indices], device=device, dtype=torch.float32),
+        'speed': torch.tensor([meas[i]['speed'] for i in initial_indices], device=device, dtype=torch.float32),
+        'delta_prev': torch.tensor([meas[i]['delta_prev'] for i in initial_indices], device=device, dtype=torch.float32),
+    }
+
+    for k_step in range(K_roll):
+        current_indices = i0s + H - 1 + k_step
+        true_next_indices = current_indices + 1
+        if np.max(true_next_indices) >= N: break
+        
+        rs = model(hists) # Get un-normalized residual prediction
+        
+        batch_controls = {
+            'acc': torch.tensor([ctrl[i]['acc'] for i in current_indices], device=device, dtype=torch.float32),
+            'delta_cmd': torch.tensor([ctrl[i]['delta_cmd'] for i in current_indices], device=device, dtype=torch.float32),
+        }
+        base_next_states = simulate_step_torch(batch_states, batch_controls, dt)
+        corrected_next_states = base_next_states.copy()
+        corrected_next_states['r_z'] += rs.squeeze(-1)
+        
+        true_next_rz = torch.tensor([meas[i]['r_z'] for i in true_next_indices], device=device, dtype=torch.float32)
+        roll_r_loss += torch.nn.functional.mse_loss(corrected_next_states['r_z'], true_next_rz, reduction='sum')
+        
+        new_feats = feat_tensor_torch(corrected_next_states, batch_controls)
+        hists = torch.cat([hists[:, 1:, :], new_feats.unsqueeze(1)], dim=1)
+        batch_states = corrected_next_states
+
+    return roll_r_loss / (B * K_roll) if K_roll > 0 else 0.0
+
+# ----------------------- TRAINING LOOPS -----------------------
+def train_rollout_svgp(model, train_loader, val_loader, meas, ctrl, H, dt, device, epochs, args):
+    scheduler = CosineAnnealingWarmRestarts(model.opt, T_0=20, T_mult=2); best_val_mse = float('inf')
+    save_path = Path(args.save); best_model_path = save_path.with_name(f"{save_path.stem}_{args.model_type}_{args.encoder}_best{save_path.suffix}")
 
     for ep in range(1, epochs+1):
-        model.train(); tot_elbo=0.0; tot_mse=0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {ep}/{epochs} [{args.encoder.upper()}]")
+        model.train(); pbar = tqdm(train_loader, desc=f"Epoch {ep}/{epochs} [SVGP Train]")
         for bx, by, idx in pbar:
-            bx, by = bx.to(device), by.to(device)
+            bx, by, i0s = bx.to(device), by.to(device), idx.numpy()
             model.opt.zero_grad()
-            dist_norm = model.gp(model.encoder(bx))
-            elbo_loss = -model.mll(dist_norm, by)
-            B = bx.size(0); hists = bx.clone()
-            i0s = idx.numpy(); initial_indices = i0s + H - 1
-            batch_states = {
-                'pos_x': torch.tensor([meas[i]['pos_x'] for i in initial_indices], device=device, dtype=torch.float32),
-                'pos_y': torch.tensor([meas[i]['pos_y'] for i in initial_indices], device=device, dtype=torch.float32),
-                'yaw':   torch.tensor([meas[i]['yaw'] for i in initial_indices], device=device, dtype=torch.float32),
-                'speed': torch.tensor([meas[i]['speed'] for i in initial_indices], device=device, dtype=torch.float32),
-                'delta_prev': torch.tensor([meas[i]['delta_prev'] for i in initial_indices], device=device, dtype=torch.float32),
-            }
+            try:
+                dist_norm = model.gp(model.encoder(bx)); elbo_loss = -model.mll(dist_norm, by)
+                roll_r = rollout_step(model, bx.clone(), i0s, H, len(meas), args.k_roll, meas, ctrl, dt, device)
+                loss = elbo_loss + args.rz_weight * roll_r
+                if torch.isnan(loss): continue
+                loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); model.opt.step()
+                pred_unnorm = model.lik(dist_norm).mean * model.y_std + model.y_mean
+                mse_unnorm = torch.mean(((pred_unnorm - (by * model.y_std + model.y_mean))**2)).item()
+                pbar.set_postfix(elbo=f"{elbo_loss.item():.2f}", mse=f"{mse_unnorm:.4f}", roll_mse=f"{roll_r.item():.4f}")
+            except Exception as e: continue
+        
+        model.eval(); val_mse = 0.0
+        val_pbar = tqdm(val_loader, desc=f"Epoch {ep}/{epochs} [SVGP Val]");
+        with torch.no_grad():
+            for bx_val, by_val, _ in val_pbar:
+                bx_val, by_val = bx_val.to(device), by_val.to(device)
+                dist_norm_val = model.gp(model.encoder(bx_val)); pred_unnorm_val = model.lik(dist_norm_val).mean * model.y_std + model.y_mean
+                target_unnorm_val = by_val * model.y_std + model.y_mean
+                val_mse += torch.nn.functional.mse_loss(pred_unnorm_val, target_unnorm_val, reduction='sum').item()
+        avg_val_mse = val_mse / len(val_loader.dataset)
+        print(f"Epoch {ep}/{epochs} | Avg. Val MSE: {avg_val_mse:.6f}")
+        if avg_val_mse < best_val_mse:
+            best_val_mse = avg_val_mse; print(f"🎉 New best model! Val MSE: {best_val_mse:.6f}. Saving...");
+            torch.save({'model_type': 'svgp', 'encoder_type': args.encoder, 'encoder': model.encoder.state_dict(), 'gp': model.gp.state_dict(), 'lik': model.lik.state_dict(), 'args': vars(args), 'y_mean': model.y_mean.cpu().numpy(), 'y_std': model.y_std.cpu().numpy()}, best_model_path)
+        scheduler.step()
 
-            roll_r_loss = 0.0
-            for k_step in range(K_roll):
-                current_indices = i0s + H - 1 + k_step
-                true_next_indices = current_indices + 1
-                if np.max(true_next_indices) >= N: break
-                rs = model(hists)
-                batch_controls = {
-                    'acc': torch.tensor([ctrl[i]['acc'] for i in current_indices], device=device, dtype=torch.float32),
-                    'delta_cmd': torch.tensor([ctrl[i]['delta_cmd'] for i in current_indices], device=device, dtype=torch.float32),
-                }
-                base_next_states = simulate_step_torch(batch_states, batch_controls, dt)
-                corrected_next_states = base_next_states.copy()
-                corrected_next_states['r_z'] += rs.squeeze(-1)
-                true_next_rz = torch.tensor([meas[i]['r_z'] for i in true_next_indices], device=device, dtype=torch.float32)
-                roll_r_loss += torch.nn.functional.mse_loss(corrected_next_states['r_z'], true_next_rz, reduction='sum')
-                new_feats = feat_tensor_torch(corrected_next_states, batch_controls)
-                hists = torch.cat([hists[:, 1:, :], new_feats.unsqueeze(1)], dim=1)
-                batch_states = corrected_next_states
-            roll_r = roll_r_loss / (B * K_roll) if K_roll > 0 else 0.0
-            loss = elbo_loss + args.rz_weight * roll_r
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            model.opt.step()
-            pred_unnorm = model.lik(dist_norm).mean * model.y_std + model.y_mean
-            tot_elbo += elbo_loss.item()
-            mse_unnorm = torch.mean(((pred_unnorm - (by * model.y_std + model.y_mean))**2)).item()
-            tot_mse  += mse_unnorm
-            pbar.set_postfix(elbo=f"{elbo_loss.item():.2f}", mse=f"{mse_unnorm:.4f}", roll_mse=f"{roll_r.item():.4f}")
-    # Validation loop omitted for brevity
+def train_rollout_linear(model, train_loader, val_loader, meas, ctrl, H, dt, device, epochs, args):
+    scheduler = CosineAnnealingWarmRestarts(model.opt, T_0=20, T_mult=2); best_val_mse = float('inf')
+    save_path = Path(args.save); best_model_path = save_path.with_name(f"{save_path.stem}_{args.model_type}_{args.encoder}_best{save_path.suffix}")
+
+    for ep in range(1, epochs+1):
+        model.train(); pbar = tqdm(train_loader, desc=f"Epoch {ep}/{epochs} [Linear Train]")
+        for bx, by, idx in pbar:
+            bx, by, i0s = bx.to(device), by.to(device), idx.numpy()
+            model.opt.zero_grad()
+            pred_norm = model.predict_normalized(bx); one_step_mse_loss = model.loss_fn(pred_norm, by)
+            roll_r = rollout_step(model, bx.clone(), i0s, H, len(meas), args.k_roll, meas, ctrl, dt, device)
+            loss = one_step_mse_loss + args.rz_weight * roll_r
+            if torch.isnan(loss): continue
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); model.opt.step()
+            mse_unnorm = torch.mean(((pred_norm * model.y_std + model.y_mean - (by * model.y_std + model.y_mean))**2)).item()
+            pbar.set_postfix(mse=f"{mse_unnorm:.4f}", roll_mse=f"{roll_r.item():.4f}")
+        
+        model.eval(); val_mse = 0.0
+        val_pbar = tqdm(val_loader, desc=f"Epoch {ep}/{epochs} [Linear Val]")
+        with torch.no_grad():
+            for bx_val, by_val, _ in val_pbar:
+                bx_val, by_val = bx_val.to(device), by_val.to(device)
+                pred_unnorm_val = model(bx_val); target_unnorm_val = by_val * model.y_std + model.y_mean
+                val_mse += torch.nn.functional.mse_loss(pred_unnorm_val, target_unnorm_val, reduction='sum').item()
+        avg_val_mse = val_mse / len(val_loader.dataset)
+        print(f"Epoch {ep}/{epochs} | Avg. Val MSE: {avg_val_mse:.6f}")
+        if avg_val_mse < best_val_mse:
+            best_val_mse = avg_val_mse; print(f"🎉 New best model! Val MSE: {best_val_mse:.6f}. Saving...");
+            torch.save({'model_type': 'linear', 'encoder_type': args.encoder, 'encoder': model.encoder.state_dict(), 'regressor': model.regressor.state_dict(), 'args': vars(args), 'y_mean': model.y_mean.cpu().numpy(), 'y_std': model.y_std.cpu().numpy()}, best_model_path)
+        scheduler.step()
 
 # ----------------------- MAIN -----------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Train a modular residual dynamics model.")
-    # --- General arguments ---
-    p.add_argument("--csv",       required=True, help="Path to the training data CSV.")
-    p.add_argument("--epochs",    type=int,   default=200)
-    p.add_argument("--batch",     type=int,   default=32)
+    p.add_argument("--csv", required=True, help="Path to the training data CSV.")
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch", type=int, default=32)
     p.add_argument("--val_split", type=float, default=0.2)
-    p.add_argument("--hist",      type=int,   default=10, help="History window size.")
-    p.add_argument("--lr",        type=float, default=1e-3)
-    p.add_argument("--wd",        type=float, default=1e-4)
-    p.add_argument("--save",      default="residual_model.pt", help="Base name for the saved model file.")
-
-    # --- Model-specific arguments ---
-    p.add_argument("--encoder",   type=str,   required=True, choices=["transformer", "lstm", "gru"], help="Type of sequence encoder to use.")
-    p.add_argument("--dmod",      type=int,   default=32, help="Model dimension (feature size).")
-    p.add_argument("--ind",       type=int,   default=150, help="Number of inducing points for SVGP.")
-    
-    # --- Rollout arguments ---
-    p.add_argument("--k_roll",    type=int,   default=5, help="Number of steps for rollout loss.")
-    p.add_argument("--rz_weight", type=float, default=1.0, help="Weight for the rollout loss term.")
-
-    # --- Encoder-specific arguments ---
-    p.add_argument("--tf_nhead",    type=int,   default=2, help="Number of heads for Transformer.")
-    p.add_argument("--tf_d_hid",  type=int,   default=128, help="Hidden dimension for Transformer's FFN.")
-    p.add_argument("--tf_nlayers",  type=int,   default=2, help="Number of layers for Transformer.")
-    p.add_argument("--tf_dropout",  type=float, default=0.1, help="Dropout for Transformer.")
-    p.add_argument("--rnn_nlayers", type=int,   default=2, help="Number of layers for LSTM/GRU.")
-    p.add_argument("--rnn_dropout", type=float, default=0.1, help="Dropout for LSTM/GRU.")
+    p.add_argument("--hist", type=int, default=10, help="History window size.")
+    p.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
+    p.add_argument("--wd", type=float, default=1e-4)
+    p.add_argument("--save", default="residual_model.pt")
+    p.add_argument("--model_type", type=str, required=True, choices=["svgp", "linear"], help="Type of prediction model head.")
+    p.add_argument("--encoder", type=str, required=True, choices=["transformer", "lstm", "gru"], help="Type of sequence encoder.")
+    p.add_argument("--dmod", type=int, default=32, help="Model dimension (feature size).")
+    p.add_argument("--ind", type=int, default=150, help="Number of inducing points for SVGP.")
+    p.add_argument("--k_roll", type=int, default=5, help="Number of steps for rollout loss.")
+    p.add_argument("--rz_weight", type=float, default=1.0)
+    p.add_argument("--tf_nhead", type=int, default=4, help="Heads for Transformer.")
+    p.add_argument("--tf_d_hid", type=int, default=128, help="Hidden dim for Transformer.")
+    p.add_argument("--tf_nlayers", type=int, default=2, help="Layers for Transformer.")
+    p.add_argument("--tf_dropout", type=float, default=0.1, help="Dropout for Transformer.")
+    p.add_argument("--rnn_nlayers", type=int, default=2, help="Layers for LSTM/GRU.")
+    p.add_argument("--rnn_dropout", type=float, default=0.1)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}, Selected Encoder: {args.encoder.upper()}")
-
-    # --- Data loading and processing ---
-    df = pd.read_csv(Path(args.csv)); times = df["time"].values.astype(np.float32)
-    pos_x_meas = df["pos_x"].values.astype(np.float32); pos_y_meas = df["pos_y"].values.astype(np.float32)
-    acc_meas  = df["acceleration"].values.astype(np.float32); speed_meas= df["speed"].values.astype(np.float32)
-    yaw_meas  = df["yaw"].values.astype(np.float32); acc_cmd   = acc_meas.copy()
-    steer_cmd = np.deg2rad(df["steer_deg"].values) * K_DELTA
+    print(f"Device: {device}, Model: {args.model_type.upper()}, Encoder: {args.encoder.upper()}")
+    df = pd.read_csv(Path(args.csv)); assert not df.isnull().values.any(), "NaN values found in input CSV!"
+    times = df["time"].values.astype(np.float32); pos_x_meas = df["pos_x"].values.astype(np.float32); pos_y_meas = df["pos_y"].values.astype(np.float32)
+    acc_meas  = df["acceleration"].values.astype(np.float32); speed_meas= df["speed"].values.astype(np.float32); yaw_meas  = df["yaw"].values.astype(np.float32)
+    acc_cmd   = acc_meas.copy(); steer_cmd = np.deg2rad(df["steer_deg"].values) * K_DELTA
     if len(times) <= args.hist + 1: raise ValueError("Not enough data for history window.")
-    N = len(times); dt = float(np.mean(np.diff(times))); r_z_meas = np.zeros(N, dtype=np.float32)
-    r_z_meas[1:] = np.diff(yaw_meas) / dt
+    N = len(times); dt = float(np.mean(np.diff(times))); r_z_meas = np.zeros(N, dtype=np.float32); r_z_meas[1:] = np.diff(yaw_meas) / dt
     meas, ctrl = [], []
     for k in range(N):
         meas.append({'pos_x': pos_x_meas[k], 'pos_y': pos_y_meas[k], 'yaw': yaw_meas[k], 'speed': speed_meas[k], 'r_z': r_z_meas[k], 'a_x': acc_meas[k], 'delta_prev': steer_cmd[k-1] if k > 0 else steer_cmd[0]})
         ctrl.append({'acc': acc_cmd[k], 'delta_cmd': steer_cmd[k]})
-    X, Y = build_data(meas, ctrl, args.hist, dt)
+    X, Y = build_data(meas, ctrl, args.hist, dt); assert not torch.isnan(X).any(); assert not torch.isnan(Y).any()
     y_mean = Y.mean(dim=0).numpy(); y_std  = Y.std(dim=0).numpy() + 1e-8
     Y_norm = (Y - torch.from_numpy(y_mean)) / torch.from_numpy(y_std)
     ds = WindowDataset(X, Y_norm); n_val = int(len(ds) * args.val_split)
     tr_ds, vl_ds = random_split(ds, [len(ds)-n_val, n_val])
-    trL = DataLoader(tr_ds, batch_size=args.batch, shuffle=True)
-    vlL = DataLoader(vl_ds, batch_size=args.batch)
+    trL = DataLoader(tr_ds, batch_size=args.batch, shuffle=True, num_workers=4, pin_memory=True)
+    vlL = DataLoader(vl_ds, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
 
-    print("\n" + "="*50); print("Values needed for validation.py:")
-    print(f"--y_mean {y_mean[0]:.8f}"); print(f"--y_std  {y_std[0]:.8f}")
-    print("="*50 + "\n")
+    print("\n" + "="*50); print(f"Values needed for validation.py:\n--y_mean {y_mean[0]:.8f}\n--y_std  {y_std[0]:.8f}"); print("="*50 + "\n")
 
-    # --- Pack encoder-specific arguments into a dictionary ---
-    encoder_args = {}
-    if args.encoder == 'transformer':
-        encoder_args = {'nhead': args.tf_nhead, 'd_hid': args.tf_d_hid, 'nlayers': args.tf_nlayers, 'dropout': args.tf_dropout}
-    else: # lstm or gru
-        encoder_args = {'nlayers': args.rnn_nlayers, 'dropout': args.rnn_dropout}
+    encoder_args = {'nlayers': args.rnn_nlayers, 'dropout': args.rnn_dropout} if args.encoder != 'transformer' else {'nhead': args.tf_nhead, 'd_hid': args.tf_d_hid, 'nlayers': args.tf_nlayers, 'dropout': args.tf_dropout}
 
-    # --- Instantiate the model with the chosen encoder ---
-    model = ResidualModel(
-        encoder_type=args.encoder,
-        encoder_args=encoder_args,
-        y_mean=y_mean, y_std=y_std, 
-        d_model=args.dmod, n_inducing=args.ind,
-        lr=args.lr, weight_decay=args.wd, device=device
-    ).to(device)
-    model.mll.num_data = len(tr_ds)
+    # --- Dispatch to the correct model and training loop ---
+    if args.model_type == 'svgp':
+        model = ResidualModel_SVGP(args.encoder, encoder_args, y_mean, y_std, args.dmod, args.ind, args.lr, args.wd, device).to(device)
+        model.mll.num_data = len(tr_ds)
+        train_rollout_svgp(model, trL, vlL, meas, ctrl, args.hist, dt, device, args.epochs, args)
+    elif args.model_type == 'linear':
+        model = ResidualModel_Linear(args.encoder, encoder_args, y_mean, y_std, args.dmod, args.lr, args.wd, device).to(device)
+        train_rollout_linear(model, trL, vlL, meas, ctrl, args.hist, dt, device, args.epochs, args)
 
-    train_rollout(model, trL, vlL, meas, ctrl, args.hist, dt, device, args.epochs, args)
-
-    # --- Save the model with a descriptive name ---
-    save_path = Path(args.save)
-    save_filename = save_path.with_name(f"{save_path.stem}_{args.encoder}{save_path.suffix}")
-    torch.save({
-        'encoder_type': args.encoder,
-        'encoder': model.encoder.state_dict(),
-        'gp':      model.gp.state_dict(),
-        'lik':     model.lik.state_dict(),
-        'args':    vars(args),
-        'y_mean':  y_mean,
-        'y_std':   y_std,
-    }, save_filename)
-    print(f"Saved final model to {save_filename}")
+    print("\nTraining complete. The best model has been saved during the training process.")
