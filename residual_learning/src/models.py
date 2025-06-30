@@ -4,7 +4,7 @@
 src/models.py
 
 This module contains all PyTorch model definitions, including the sequence
-encoders (Transformer, LSTM, GRU) and the top-level residual models
+encoders (Transformer, LSTM, GRU, MobileViT) and the top-level residual models
 (probabilistic SVGP and deterministic Linear).
 """
 import torch
@@ -72,18 +72,58 @@ class GRUEncoder(torch.nn.Module):
         h_t, _ = self.gru(x)
         return self.final_norm(h_t[:, -1, :])
 
+class MobileViTEncoder(torch.nn.Module):
+    """
+    A 1D adaptation of the MobileViT concept for sequential data.
+    It uses 1D convolutions to learn local features efficiently and a
+    Transformer to learn global relationships.
+    """
+    def __init__(self, input_dim=6, d_model=32, nhead=2, d_hid=128, nlayers=2, dropout=0.1):
+        super().__init__()
+        
+        # Convolutional block to learn local features
+        self.conv_block = torch.nn.Sequential(
+            # Input shape: (Batch, Channels=input_dim, Length=history)
+            torch.nn.Conv1d(in_channels=input_dim, out_channels=d_model, kernel_size=3, padding=1),
+            torch.nn.BatchNorm1d(d_model),
+            torch.nn.SiLU(),
+            torch.nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1),
+            torch.nn.BatchNorm1d(d_model),
+            torch.nn.SiLU()
+        )
+
+        # Standard Transformer Encoder for global features
+        encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
+        self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
+        
+        self.final_norm = torch.nn.LayerNorm(d_model)
+        self.outp = torch.nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        # Input x shape: (Batch, History, Features)
+        x_conv = x.permute(0, 2, 1)
+        local_features = self.conv_block(x_conv)
+        local_features = local_features.permute(0, 2, 1)
+
+        global_features = self.transformer_encoder(local_features)
+        
+        fused_features = global_features + local_features
+        h = fused_features.mean(dim=1)
+        
+        return self.final_norm(self.outp(h))
+
 
 def build_encoder(encoder_type: str, d_model: int, encoder_args: dict) -> torch.nn.Module:
-    """
-    Factory function to build the chosen encoder.
-    Simplifies model creation in the main script.
-    """
+    """Factory function to build the chosen encoder."""
     if encoder_type == 'transformer':
         return TransformerEncoder(input_dim=6, d_model=d_model, **encoder_args)
     if encoder_type == 'lstm':
         return LSTMEncoder(input_dim=6, d_model=d_model, **encoder_args)
     if encoder_type == 'gru':
         return GRUEncoder(input_dim=6, d_model=d_model, **encoder_args)
+    if encoder_type == 'mobilevit':
+        # MobileViT uses the same args as the Transformer
+        return MobileViTEncoder(input_dim=6, d_model=d_model, **encoder_args)
     raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
@@ -133,12 +173,11 @@ class ResidualModel_SVGP(torch.nn.Module):
         
         self.encoder = build_encoder(encoder_type, d_model, encoder_args).to(device)
         
-        # Initialize inducing points for the GP layer
         Z = torch.randn(n_inducing, d_model, device=device)
         self.gp  = SVGPLayer(Z).to(device)
         
         self.lik = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=1).to(device)
-        self.mll = gpytorch.mlls.VariationalELBO(self.lik, self.gp, num_data=1) # num_data is set later
+        self.mll = gpytorch.mlls.VariationalELBO(self.lik, self.gp, num_data=1)
         
         self.opt = torch.optim.Adam([
             {'params': self.encoder.parameters(), 'lr': lr, 'weight_decay': weight_decay},
@@ -147,9 +186,6 @@ class ResidualModel_SVGP(torch.nn.Module):
         ])
 
     def forward(self, x):
-        """
-        Defines the forward pass for inference. Returns the un-normalized residual prediction.
-        """
         z = self.encoder(x)
         dist = self.gp(z)
         pred_norm = self.lik(dist).mean
@@ -158,7 +194,6 @@ class ResidualModel_SVGP(torch.nn.Module):
 class ResidualModel_Linear(torch.nn.Module):
     """
     The complete deterministic residual model, combining an encoder with a simple Linear head.
-    Used for ablation studies to prove the value of the probabilistic approach.
     """
     def __init__(self, encoder_type, encoder_args, y_mean, y_std, d_model, lr, weight_decay, device):
         super().__init__()
@@ -177,16 +212,10 @@ class ResidualModel_Linear(torch.nn.Module):
         ])
 
     def forward(self, x):
-        """
-        Defines the forward pass for inference. Returns the un-normalized residual prediction.
-        """
         z = self.encoder(x)
         pred_norm = self.regressor(z)
         return pred_norm * self.y_std + self.y_mean
 
     def predict_normalized(self, x):
-        """
-        Helper function to get the normalized prediction, used for calculating loss.
-        """
         z = self.encoder(x)
         return self.regressor(z)
